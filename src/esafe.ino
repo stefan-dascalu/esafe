@@ -4,204 +4,259 @@
 #include <Servo.h>
 #include <Keypad.h>
 
-// define hardware pins
-constexpr uint8_t pin_buzzer     = 1;
-constexpr uint8_t pin_led_green  = 12;
-constexpr uint8_t pin_led_red    = 13;
-constexpr uint8_t pin_servo      = 10;
+// define pins for buzzer, green LED, red LED, and servo
+constexpr uint8_t PIN_BUZZER    = 11;
+constexpr uint8_t PIN_LED_GREEN = 12;
+constexpr uint8_t PIN_LED_RED   = 13;
+constexpr uint8_t PIN_SERVO     = 10;
 
-// define servo positions
-constexpr uint8_t servo_locked   = 110;
-constexpr uint8_t servo_unlocked =  50;
+// define servo positions for locked and unlocked (110° and 20°)
+constexpr uint8_t SERVO_LOCKED   = 110;
+constexpr uint8_t SERVO_UNLOCKED =  20;
 
-// security settings
-const char    master_pin[]       = "0123";
-const uint8_t max_pin_length     = sizeof(master_pin) - 1;
-const uint8_t max_wrong         = 3;
-const uint32_t alarm_duration   = 5000UL;
+// security settings: master PIN, maximum PIN length, allowed wrong attempts
+const char    MASTER_PIN[]    = "0123";
+constexpr uint8_t MAX_PIN_LEN = sizeof(MASTER_PIN) - 1;
+constexpr uint8_t MAX_WRONG   = 3;
+const uint32_t ALARM_DUR      = 5000UL;  // duration of alarm in ms
 
-// operating hours (inclusive)
-constexpr uint8_t window_start  = 9;
-constexpr uint8_t window_end    = 17;
+// allowed time window for unlocking (9 to 23)
+constexpr uint8_t WINDOW_START =  9;
+constexpr uint8_t WINDOW_END   = 23;
 
-// rtc and display objects
+// initialize RTC and LCD display objects
 RTC_DS1307        rtc;
 LiquidCrystal_I2C lcd(0x27,16,2);
-Servo latch_servo;
 
-// keypad layout
-const byte rows = 4, cols = 4;
-char keys[rows][cols] = {
+// configure servo and 4x4 keypad matrix
+Servo latchServo;
+const byte ROWS = 4, COLS = 4;
+char keys[ROWS][COLS] = {
   {'D','C','B','A'},
   {'#','9','6','3'},
   {'0','8','5','2'},
   {'*','7','4','1'}
 };
-byte row_pins[rows] = {2,3,4,5};
-byte col_pins[cols] = {6,7,8,9};
-Keypad keypad(makeKeymap(keys), row_pins, col_pins, rows, cols);
+byte rowPins[ROWS] = {2,3,4,5};
+byte colPins[COLS] = {6,7,8,9};
+Keypad keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// runtime variables
+// runtime variables: entered PIN, wrong attempt counter, last unlock time, last display update timestamp, unlock state
 String   entered;
-uint8_t  wrong_count   = 0;
-DateTime last_unlock(0);
-uint32_t last_update_ms = 0;
+uint8_t  wrongCount     = 0;
+DateTime lastUnlock((uint32_t)0);
+uint32_t lastDisplayMs   = 0;
+bool     hasUnlocked     = false;
 
-// check if current hour is within allowed window
-bool in_window(const DateTime& t) {
+// timestamp for automatic servo relock after unlock
+uint32_t lockRestoreMs   = 0;
+
+// helper functions
+
+// clear an entire row on the LCD
+void clearLine(uint8_t row) {
+  lcd.setCursor(0,row);
+  for (uint8_t i = 0; i < 16; ++i) lcd.print(' ');
+}
+
+// check if current time is within allowed window
+bool inWindow(const DateTime& t) {
   uint8_t h = t.hour();
-  return h >= window_start && h <= window_end;
+  return h >= WINDOW_START && h <= WINDOW_END;
 }
 
-// clear entered pin on display
-void reset_entry() {
+// update the LCD display with live time and context messages
+void updateDisplay() {
+  DateTime now = rtc.now();
+  char buf[17];
+
+  // display current time in HH:MM:SS format on row 0
+  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", now.hour(), now.minute(), now.second());
+  clearLine(0);
+  lcd.setCursor(0,0);
+  lcd.print(buf);
+
+  clearLine(1);
+
+  // if user is typing PIN digits
+  if (entered.length() > 0) {
+    if (!hasUnlocked) {
+      // before first unlock: show PIN:**** on row 1
+      lcd.setCursor(0,1);
+      lcd.print("PIN:");
+      lcd.setCursor(4,1);
+      for (uint8_t i = 0; i < entered.length(); ++i) lcd.print('*');
+    } else {
+      // after unlocking: show "Last HH:MM" on row 1
+      snprintf(buf, sizeof(buf), "Last %02u:%02u", lastUnlock.hour(), lastUnlock.minute());
+      lcd.setCursor(0,1);
+      lcd.print(buf);
+      // and show asterisks for new PIN entry on row 0 after time
+      uint8_t offset = 8;
+      lcd.setCursor(offset,0);
+      lcd.print(' ');
+      for (uint8_t i = 0; i < entered.length(); ++i) lcd.print('*');
+    }
+    return;
+  }
+
+  // if no digits are entered
+  if (hasUnlocked) {
+    // after unlocking: show last unlock time on row 1
+    snprintf(buf, sizeof(buf), "Last %02u:%02u", lastUnlock.hour(), lastUnlock.minute());
+    lcd.setCursor(0,1);
+    lcd.print(buf);
+  } else {
+    // before unlocking: prompt for PIN on row 1
+    lcd.setCursor(0,1);
+    lcd.print("PIN:");
+  }
+}
+
+// reset PIN entry buffer and refresh display
+void resetEntry() {
   entered = "";
-  lcd.setCursor(0,1);
-  lcd.print("PIN:            ");
-  lcd.setCursor(5,1);
+  updateDisplay();
 }
 
-// sound alarm for wrong attempts
-void trigger_alarm() {
+// trigger an alarm after too many wrong PIN attempts
+void triggerAlarm() {
+  clearLine(1);
   lcd.setCursor(0,1);
-  lcd.print("ALARM!         ");
+  lcd.print("ALARM!");
   uint32_t start = millis();
-  while (millis() - start < alarm_duration) {
-    digitalWrite(pin_led_red, HIGH);
-    tone(pin_buzzer, 4000, 200);
+  while (millis() - start < ALARM_DUR) {
+    digitalWrite(PIN_LED_RED, HIGH);
+    tone(PIN_BUZZER, 4000);
     delay(200);
-    digitalWrite(pin_led_red, LOW);
+    digitalWrite(PIN_LED_RED, LOW);
+    noTone(PIN_BUZZER);
     delay(200);
   }
-  wrong_count = 0;
-  reset_entry();
+  wrongCount = 0;
+  resetEntry();
 }
 
-// move servo to locked position
-void lock_door() {
-  latch_servo.write(servo_locked);
-  digitalWrite(pin_led_green, LOW);
-  digitalWrite(pin_led_red, LOW);
+// perform unlock sequence: move servo, beep, display message, schedule relock
+void unlockDoor(const DateTime& now) {
+  clearLine(1);
+  latchServo.write(SERVO_UNLOCKED);
+  digitalWrite(PIN_LED_GREEN, HIGH);
+  tone(PIN_BUZZER, 3000);
   lcd.setCursor(0,1);
-  lcd.print("LOCKED         ");
-  tone(pin_buzzer, 1500, 100);
+  lcd.print("UNLOCKED");
+  lastUnlock = now;
+  hasUnlocked = true;
   delay(1000);
-  reset_entry();
+  noTone(PIN_BUZZER);
+  digitalWrite(PIN_LED_GREEN, LOW);
+
+  // schedule servo to relock after 5 seconds
+  lockRestoreMs = millis() + 5000;
+  resetEntry();
 }
 
-// move servo to unlocked position and log time
-void unlock_door(const DateTime& now) {
-  latch_servo.write(servo_unlocked);
-  digitalWrite(pin_led_green, HIGH);
-  digitalWrite(pin_led_red, LOW);
-  tone(pin_buzzer, 3000, 200);
+// show outside hours message when unlocking is attempted out of window
+void outsideHours() {
+  clearLine(1);
   lcd.setCursor(0,1);
-  lcd.print("UNLOCKED       ");
-  last_unlock = now;
-  delay(2000);
-  digitalWrite(pin_led_green, LOW);
-  reset_entry();
+  lcd.print("OUTSIDE HOURS");
+  digitalWrite(PIN_LED_RED, HIGH);
+  tone(PIN_BUZZER, 2500);
+  delay(1000);
+  noTone(PIN_BUZZER);
+  digitalWrite(PIN_LED_RED, LOW);
+  resetEntry();
 }
 
-// handle each key press from keypad
-void handle_key(char k) {
+// beep briefly for wrong PIN
+void wrongPin() {
+  tone(PIN_BUZZER, 2000);
+  delay(300);
+  noTone(PIN_BUZZER);
+  resetEntry();
+}
+
+// handle keypad input: C to clear, D to submit, digits to append
+void handleKey(char k) {
   if (k == 'C') {
-    reset_entry();
+    resetEntry();
     return;
   }
   if (k == 'D') {
-    if (entered == master_pin) {
+    if (entered == MASTER_PIN) {
       DateTime now = rtc.now();
-      if (in_window(now)) unlock_door(now);
-      else {
-        lcd.setCursor(0,1);
-        lcd.print("OUTSIDE HOURS  ");
-      }
+      if (inWindow(now)) 
+          unlockDoor(now);
+      else
+          outsideHours();
     } else {
-      trigger_alarm();
+      if (++wrongCount >= MAX_WRONG) 
+          triggerAlarm();
+      else
+          wrongPin();
     }
     return;
   }
-  if (!isDigit(k)) return;
-  if (entered.length() < max_pin_length) {
+  if (!isDigit(k))
+    return;
+  if (entered.length() < MAX_PIN_LEN) {
     entered += k;
-    lcd.setCursor(5 + entered.length() - 1, 1);
-    lcd.print('*');
-  }
-  if (entered.length() == max_pin_length) {
-    if (entered == master_pin) {
-      DateTime now = rtc.now();
-      if (in_window(now)) unlock_door(now);
-      else {
-        lcd.setCursor(0,1);
-        lcd.print("OUTSIDE HOURS  ");
-      }
-      wrong_count = 0;
-    } else {
-      wrong_count++;
-      if (wrong_count >= max_wrong) trigger_alarm();
-      else {
-        lcd.setCursor(0,1);
-        lcd.print("WRONG PIN      ");
-        tone(pin_buzzer, 2000, 250);
-        delay(500);
-        reset_entry();
-      }
-    }
+    updateDisplay();
   }
 }
 
-// update time and last unlock info on display
-void update_display() {
-  DateTime now = rtc.now();
-  char buf[17];
-  snprintf(buf, sizeof(buf), "%02u:%02u:%02u %02u/%02u/%02u",
-           now.hour(), now.minute(), now.second(),
-           now.day(), now.month(), now.year() % 100);
-  lcd.setCursor(0,0);
-  lcd.print(buf);
-  if (entered.length() == 0) {
-    lcd.setCursor(0,1);
-    if (last_unlock.unixtime() != 0) {
-      snprintf(buf, sizeof(buf), "Last %02u:%02u %02u/%02u",
-               last_unlock.hour(), last_unlock.minute(),
-               last_unlock.day(), last_unlock.month());
-      lcd.print(buf);
-    } else {
-      reset_entry();
-    }
-  }
-}
-
+// initial setup: configure pins, servo, I2C, LCD, and RTC
 void setup() {
-  pinMode(pin_buzzer, OUTPUT);
-  pinMode(pin_led_green, OUTPUT);
-  pinMode(pin_led_red, OUTPUT);
-  latch_servo.attach(pin_servo);
-  latch_servo.write(servo_locked);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+
+  latchServo.attach(PIN_SERVO);
+  latchServo.write(SERVO_LOCKED);
 
   Wire.begin();
   lcd.init();
   lcd.backlight();
 
+  // show startup message
+  lcd.clear();
+  lcd.print("eSafe starting");
+  delay(2000);
+  lcd.clear();
+
   if (!rtc.begin()) {
     lcd.clear();
-    lcd.print("rtc error");
-    while (true);
+    lcd.print("RTC ERROR");
+    while (1);
   }
   if (!rtc.isrunning()) {
-    rtc.adjust(DateTime(__DATE__, __TIME__));
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
 
-  last_update_ms = millis();
-  update_display();
+  entered = "";
+  lastDisplayMs = millis();
+  updateDisplay();
 }
 
+// main loop: check for relock time, update display, and read keypad
 void loop() {
-  if (millis() - last_update_ms >= 1000) {
-    last_update_ms = millis();
-    update_display();
+  uint32_t nowMs = millis();
+
+  // relock servo if scheduled time has passed
+  if (lockRestoreMs && nowMs >= lockRestoreMs) {
+    latchServo.write(SERVO_LOCKED);
+    lockRestoreMs = 0;
   }
+
+  // update display every second without blocking
+  if (nowMs - lastDisplayMs >= 1000) {
+    lastDisplayMs = nowMs;
+    updateDisplay();
+  }
+
+  // read keypad input
   char k = keypad.getKey();
-  if (k) handle_key(k);
+  if (k)
+    handleKey(k);
 }
