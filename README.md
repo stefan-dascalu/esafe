@@ -1,7 +1,8 @@
 # eSafe  
-**Digital Lockbox with Arduino Uno**
 ![eSafe](images/esafe1.jpeg)
 
+
+**Digital Lockbox with Arduino Uno**
 A DIY electronic safe that brings together multiple embedded-systems concepts into one project:
 
 - **4×4 matrix keypad** for secure 4-digit PIN entry  
