@@ -1,5 +1,6 @@
 # eSafe  
 **Digital Lockbox with Arduino Uno**
+![eSafe](images/esafe1.png)
 
 A DIY electronic safe that brings together multiple embedded-systems concepts into one project:
 
