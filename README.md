@@ -34,3 +34,6 @@ A DIY electronic safe that brings together multiple embedded-systems concepts in
 
 For full schematics, bill of materials, code structure and docs, see the OCW project page:  
 <https://ocw.cs.pub.ro/courses/pm/prj2025/eradu/stefan.dascalu2612>
+
+For video demo:
+<https://youtube.com/shorts/6ttbbS6FWxo>
